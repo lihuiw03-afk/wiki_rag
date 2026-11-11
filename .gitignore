@@ -1,0 +1,23 @@
+.venv/
+__pycache__/
+*.pyc
+rag/traces/*.jsonl
+.qmd/index.sqlite
+.qmd/*.sqlite
+.cache/
+rag/hot/
+rag/assets/*
+!rag/assets/.gitkeep
+rag/visual_cache/*
+!rag/visual_cache/.gitkeep
+.qmd/*.sqlite-wal
+.qmd/*.sqlite-shm
+.qmd/.qmd-embed.lock
+.rag_refresh.lock
+rag/logs/
+rag/jobs/
+rag/*.pid
+# 编译流水线瞬态状态文件（运行时生成，不应提交）
+.pending
+.pending.processing
+.compile.lock

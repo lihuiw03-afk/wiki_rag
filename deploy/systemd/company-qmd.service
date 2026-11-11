@@ -1,0 +1,15 @@
+[Unit]
+Description=Company Wiki QMD shared daemon
+After=network.target
+
+[Service]
+Type=simple
+User=sun
+WorkingDirectory=/home/demo/company-wiki
+ExecStart=/usr/bin/env qmd mcp --http --host 127.0.0.1 --port 8181
+Restart=on-failure
+RestartSec=3
+Environment=QMD_FORCE_CPU=0
+
+[Install]
+WantedBy=multi-user.target

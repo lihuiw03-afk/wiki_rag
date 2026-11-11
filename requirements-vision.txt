@@ -1,0 +1,7 @@
+# Optional multimodal extraction dependencies.
+# Install the PaddlePaddle runtime appropriate for your CPU/GPU first, then:
+paddleocr>=3.0,<4
+Pillow>=10.0
+
+# Tesseract is an OS package fallback, not a Python dependency:
+#   sudo apt install tesseract-ocr tesseract-ocr-chi-sim

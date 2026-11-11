@@ -1,0 +1,253 @@
+project:
+  wiki_dir: wiki
+  raw_dir: raw
+  projection_dir: rag/qmd
+  extracted_dir: rag/extracted
+  manifest: rag/manifest.json
+  graph: rag/graph.json
+  lexicon: rag/lexicon.json
+  traces_dir: rag/traces
+
+qmd:
+  base_url: http://127.0.0.1:8181
+  # Windows 适配：daemon 空闲约5分钟卸载模型，冷启动加载需 ~2 分钟；30s 会导致首查超时回退。
+  timeout_seconds: 180
+  cli_fallback: true
+  collections:
+    core: company-core
+    evidence: company-evidence
+
+# 云端重排（10-07 接入）：qwen3-rerank（百炼），一次调用批量打分（实测 ~0.2-1s），
+# 替代本地逐候选 GGUF 重排（0.5-2.8s/候选）。失败回退：local=重新走本地重排 / rrf=保持融合序。
+# 密钥复用 vision.env（仓库外）。回退=git revert 本提交，或 enabled: false。
+rerank_api:
+  enabled: true
+  base_url: https://dashscope.aliyuncs.com
+  path: /api/v1/services/rerank/text-rerank/text-rerank
+  model: qwen3-rerank
+  key_file: C:/Users/demo/.config/company-wiki/vision.env
+  key_var: COMPANY_WIKI_VISION_API_KEY
+  timeout_seconds: 20
+  max_doc_chars: 4000
+  fetch_min_score: 0.05
+  fallback: local
+
+retrieval:
+  default_mode: balanced
+  # Lexical leg policy: conditional (production default, C2) | on | off
+  # conditional = lex leg carries only identifier-shaped tokens (#U codes / date fragments /
+  # long alnum tokens); name/title terms never enter lex. fast mode is unchanged.
+  # Rollback: set to "on" (old behavior).
+  lex_leg: "conditional"
+  modes:
+    fast:
+      collections: [company-core]
+      candidate_limit: 12
+      limit: 6
+      min_score: 0.15
+      rerank: false
+      use_vector: false
+      use_graph: false
+      include_evidence: false
+    balanced:
+      collections: [company-core, company-evidence]
+      # Candidate cap is deliberately conservative; tune against your own corpus.
+      candidate_limit: 20
+      limit: 10
+      min_score: 0.20
+      rerank: true
+      use_vector: true
+      use_graph: true
+      include_evidence: true
+    deep:
+      collections: [company-core, company-evidence]
+      # Smaller candidate cap reduces rerank cost; tune against your own corpus.
+      candidate_limit: 16
+      limit: 14
+      min_score: 0.18
+      rerank: true
+      use_vector: true
+      use_graph: true
+      include_evidence: true
+
+structure:
+  # Conservative structural injection: QMD retrieves first, structure expands second.
+  parent_score_threshold: 0.72
+  child_score_threshold: 0.80
+  graph_score_threshold: 0.74
+  parent_score_discount: 0.72
+  child_score_discount: 0.62
+  graph_score_discount: 0.58
+  evidence_score_discount: 0.66
+  evidence_neighbor_score_discount: 0.76
+  max_children_per_hit: 2
+  max_graph_neighbors: 4
+  max_source_support: 3
+  max_augmented_hits: 14
+
+  # One auxiliary QMD pass ranks sections inside graph-neighbor pages and chunks
+  # inside raw sources referenced by high-confidence Wiki hits. We filter the
+  # results to the allowed page/source set and use a local lexical scorer only
+  # when the target did not enter QMD's returned candidate window.
+  # 10-07 调优：结构扩展的两路受限检索实测单次 22-56s（证据块 rerank ≈2.8s/候选）——
+  # 它们只是选辅助块，RRF+标签打分足够；关闭后回到毫秒级，主检索 rerank 保留。
+  # 候选值保留原窗口（rerank 关闭时几乎无成本）。回退：两个 flag 改回 true。
+  restricted_candidate_limit: 72
+  restricted_limit: 36
+  restricted_min_score: 0.05
+  graph_restricted_rerank: false
+  source_restricted_rerank: false
+  max_restricted_query_labels: 8
+  source_support_per_raw: 1
+  # 多实体覆盖（bench X01，2026-10-09）：对照类问句为缺席实体注入"最佳章节"的得分折扣
+  # 与受限检索 rerank 开关（沿用图扩展的受限检索机制）
+  entity_score_discount: 0.95
+  entity_restricted_rerank: false
+
+context:
+  # Defaults are overridden by the selected context policy below.
+  # Context budget is a deployment default; tune against your own corpus.
+  max_chars: 12000
+  max_hits: 12
+  # Emission ordering: density (score / block length) | score (legacy behavior)
+  # Rollback: set to score.
+  budget_policy: density
+
+  policies:
+    balanced:
+      max_chars: 12000
+      max_hits: 12
+      max_hits_per_wiki_page: 3
+      max_hits_per_raw_source: 3
+      reserve_core_hits: 3
+      reserve_evidence_hits: 3
+      wiki_repeat_penalty: 0.86
+      raw_repeat_penalty: 0.84
+      evidence_neighbor_radius: 1
+      evidence_neighbor_seed_hits: 2
+      max_evidence_neighbor_hits: 2
+
+    diversity:
+      max_chars: 19000
+      max_hits: 12
+      max_hits_per_wiki_page: 2
+      max_hits_per_raw_source: 2
+      reserve_core_hits: 3
+      reserve_evidence_hits: 3
+      wiki_repeat_penalty: 0.76
+      raw_repeat_penalty: 0.68
+      evidence_neighbor_radius: 0
+      evidence_neighbor_seed_hits: 0
+      max_evidence_neighbor_hits: 0
+
+    source-focused:
+      # 10-07 调优：语料 10/28 文档内容超 24000 → 放宽至 32000（覆盖到 ~42000 以下文档的大部分）；
+      # 块数 14→18、每源 8→10 与之配套（实际仍以字符预算为主导约束）。
+      max_chars: 32000
+      max_hits: 18
+      max_hits_per_wiki_page: 3
+      max_hits_per_raw_source: 10
+      reserve_core_hits: 1
+      reserve_evidence_hits: 6
+      wiki_repeat_penalty: 0.88
+      raw_repeat_penalty: 1.00
+      evidence_neighbor_radius: 1
+      evidence_neighbor_seed_hits: 4
+      max_evidence_neighbor_hits: 6
+
+projection:
+  summary_chars: 260
+  # Evidence chunks are built from structural blocks and keep source locators.
+  # The union of chunks preserves all extracted text; overlap only duplicates context.
+  evidence_chunk_chars: 3600
+  evidence_overlap_chars: 400
+  include_infrastructure_pages: false
+
+hot_document:
+  dir: rag/hot
+  recent_ttl_seconds: 7200
+  # Small newly uploaded docs bypass retrieval and are sent as normalized full text.
+  full_document_chars: 42000
+  # Large docs use structure-aware local retrieval while Wiki/QMD compilation catches up.
+  chunk_chars: 3600
+  overlap_chars: 400
+  seed_hits: 6
+  neighbor_radius: 1
+  max_hits: 10
+  max_context_chars: 36000
+
+trace:
+  enabled: true
+  include_query_text: true
+
+multimodal:
+  # Turn visual content into retrievable text evidence before QMD indexing.
+  # Native text extraction, OCR and VLM semantics are merged into the same EvidenceBlock stream.
+  enabled: true
+  assets_dir: rag/assets
+  cache_dir: rag/visual_cache
+
+  ocr:
+    enabled: true
+    # auto: PaddleOCR first, then local tesseract executable as fallback.
+    provider: auto
+    lang: ch
+    min_score: 0.45
+    # 方向分类/文本行方向：轻量（<1s）保留；去扭曲(UVDoc)：单页约7s且仅对拍摄/弯曲扫描件有效，
+    # 本项目以数字文档为主 → 关闭。若需处理手机拍摄的弯曲文档，改回 true。
+    use_doc_orientation_classify: true
+    use_doc_unwarping: false
+    use_textline_orientation: true
+    # paddlepaddle 已降级至 3.2.2（规避 3.3.x 的 PIR+oneDNN CPU 崩溃 bug），oneDNN 可正常启用。
+    # 若升级回 3.3.x，须改回 false。
+    enable_mkldnn: true
+    # 轻量模型：v6_small 比默认 v6_medium 快约 5 倍，实测质量几乎无损；需更高精度改回默认（v6_medium）。
+    text_detection_model_name: PP-OCRv6_small_det
+    text_recognition_model_name: PP-OCRv6_small_rec
+    # Optional PaddleOCR runtime tuning:
+    # device: gpu
+    # engine: paddle_static
+    tesseract_lang: chi_sim+eng
+    tesseract_psm: 6
+
+  vision:
+    enabled: true
+    # Background/full ingestion only. Calls a remote multimodal model API using
+    # an OpenAI-compatible chat-completions schema; no local VLM is required.
+    # 密钥经环境变量注入（本地文件 ~/.config/company-wiki/vision.env，由 rag_refresh 自动加载；不入 git）。
+    provider: model_api
+    base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    model: "qwen3.8-flash"
+    base_url_env: COMPANY_WIKI_VISION_BASE_URL
+    model_env: COMPANY_WIKI_VISION_MODEL
+    api_key_env: COMPANY_WIKI_VISION_API_KEY
+    timeout_seconds: 90
+    # Many hosted providers do not expose /models consistently; keep probing off
+    # and let the first real image request verify credentials/connectivity.
+    probe_on_start: false
+    probe_timeout_seconds: 1.5
+    max_tokens: 1400
+
+  rendering:
+    # Whole-page/slide rendering is essential for arrows, SmartArt, grouping and layout.
+    dpi: 160
+    office_timeout_seconds: 90
+    render_pptx_slides: true
+    render_docx_pages: true
+    render_xlsx_pages: false
+
+  limits:
+    min_image_width: 120
+    min_image_height: 80
+    max_render_pages: 200
+    max_visual_assets_per_document: 300
+    max_analyzed_assets_per_document: 300
+
+  hot:
+    # Hot uploads never call the external OCR/Vision API. They only materialize
+    # page/slide/image assets; rag_ask returns the relevant paths to Hermes native Vision.
+    vision_strategy: hermes_native
+    max_materialized_visual_assets: 24
+    max_render_pages: 12
+    max_eager_visual_assets: 0
+    max_hermes_vision_assets_per_query: 4

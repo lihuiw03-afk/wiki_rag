@@ -1,0 +1,23 @@
+[project]
+name = "company-wiki-rag-v2"
+version = "2.4.0"
+description = "LLM-Wiki + QMD hybrid graph RAG with Hot Hermes Vision and background OCR/API-Vision evidence"
+requires-python = ">=3.10"
+dependencies = [
+  "PyYAML>=6.0",
+  "python-docx>=1.1",
+  "python-pptx>=1.0",
+  "pypdf>=5.0",
+  "Pillow>=10.0",
+  "PyMuPDF>=1.24",
+  "openpyxl>=3.1",
+]
+
+[project.scripts]
+company-rag = "rag_gateway.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["rag_gateway*"]
+
+[project.optional-dependencies]
+vision = ["paddleocr>=3.0,<4"]
