@@ -62,8 +62,13 @@ python bench/run_ablation.py --sets 58 --config config/rag.yaml
 python bench/run_lex_ab.py --policy C2 --sets 58 --repeat 3
 python bench/analyze_lex_ab.py
 
-# 可选答案质量抽查（需要仓库外的模型 Key）
-python bench/judge.py --sets 58
+# E6 预算实验
+python bench/run_experiments.py run e6 A --repeat 3
+python bench/analyze_e6.py
+
+# QMD 扩展调用合并
+python bench/exp_qmd_merge.py --set 58 --variants baseline,merged
+python bench/samebatch_merge.py
 ```
 
 指标定义见 `docs/EVALUATION.md`；注意 **页口径与金标口径不可混用**。

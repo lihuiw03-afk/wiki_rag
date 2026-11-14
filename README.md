@@ -15,7 +15,7 @@
 - **多模态高保真 Evidence Extraction**：长期索引采用 Native Text + OCR + Vision API 三路合并。图片、扫描页、流程图、SmartArt、图表/截图等视觉语义会转为 EvidenceBlock，写入 `rag/qmd/evidence` 并被 QMD 索引。每个 chunk 保存页码/幻灯片/段落/表格/单元格/视觉资产等 source locator。
 - **V2.4 双视觉路径**：Hot Document 视觉问题交给 Hermes 内置 Vision，后台 full ingestion 才调用外部模型 API 生成可缓存、可索引的长期 `visual_semantics`。
 - 所有员工拥有完整知识权限；Profile 仅用于 trace 和“最近上传文件”关联，不做 ACL。
-- 内置可复现的检索评测（`bench/`）：页覆盖、金标覆盖、MRR、入选率、SHR、延迟与可选答案质量抽查；方法与完整实验链见 [docs/EVALUATION.md](docs/EVALUATION.md)。
+- 内置可复现的检索评测（`bench/`）：页覆盖、金标覆盖、MRR、入选率、SHR、延迟与可选答案质量抽查；方法与核心实验见 [docs/EVALUATION.md](docs/EVALUATION.md)。
 
 ## 项目目录
 
@@ -273,7 +273,7 @@ python3 scripts/rag_ask.py "这份访谈主要讲了什么？" \
 
 ## 评测
 
-仓库自带可复现的检索评测执行器（`bench/`），指标定义、实验链与复现方式见
+仓库自带可复现的检索评测执行器（`bench/`），指标定义、核心实验与复现方式见
 [docs/EVALUATION.md](docs/EVALUATION.md)；如何接自己的语料见
 [docs/BYO_CORPUS.md](docs/BYO_CORPUS.md)。
 
