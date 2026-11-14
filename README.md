@@ -15,6 +15,7 @@
 - **多模态高保真 Evidence Extraction**：长期索引采用 Native Text + OCR + Vision API 三路合并。图片、扫描页、流程图、SmartArt、图表/截图等视觉语义会转为 EvidenceBlock，写入 `rag/qmd/evidence` 并被 QMD 索引。每个 chunk 保存页码/幻灯片/段落/表格/单元格/视觉资产等 source locator。
 - **V2.4 双视觉路径**：Hot Document 视觉问题交给 Hermes 内置 Vision，后台 full ingestion 才调用外部模型 API 生成可缓存、可索引的长期 `visual_semantics`。
 - 所有员工拥有完整知识权限；Profile 仅用于 trace 和“最近上传文件”关联，不做 ACL。
+- 内置可复现的检索评测（`bench/`）：页覆盖、金标覆盖、MRR、入选率、SHR、延迟与可选答案质量抽查；方法与完整实验链见 [docs/EVALUATION.md](docs/EVALUATION.md)。
 
 ## 项目目录
 
@@ -46,6 +47,7 @@ company-wiki-rag-v2/
 │   ├── router.py                # RAG 深度 + Context policy
 │   ├── graph.py                 # Wiki Graph
 │   └── search.py                # formal QMD RAG orchestration/context builder
+├── bench/                       # 评测/实验执行器（不含语料与结果）
 ├── config/rag.yaml
 ├── .qmd/index.yml
 ├── scripts/
@@ -269,6 +271,27 @@ python3 scripts/rag_ask.py "这份访谈主要讲了什么？" \
 - Hot Document 不调用外部 Vision API，视觉理解由 Hermes 内置 Vision 即时完成；完整 `rag_refresh.py` 才负责 OCR + API Vision 的长期 full multimodal evidence。
 - DOCX 脚注、批注、修订历史仍可能需要更专门的 OOXML extractor；原始文件始终保留，因此不会丢失事实源。
 
+## 评测
+
+仓库自带可复现的检索评测执行器（`bench/`），指标定义、实验链与复现方式见
+[docs/EVALUATION.md](docs/EVALUATION.md)；如何接自己的语料见
+[docs/BYO_CORPUS.md](docs/BYO_CORPUS.md)。
+
+公开仓**不附带真实语料、题集、金标或结果文件**，因此下表是聚合历史结果，不是开箱即跑的基准；
+用同一套脚本在自己的语料上复测才有可比较的数字。
+
+| 集合 | page@5 | page@10 | gold@5 | gold@10 | MRR | sel_ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| 58 自然语言 | .911 | .974 | .911 | .974 | .837 | .983 |
+| hard50 | .770 | .790 | .870 | .910 | .803 | .960 |
+| 24 字面串 | — | — | .875 | — | — | — |
+
+- 推荐配置：`lex_leg=conditional` + `budget_policy=density`；延迟 p50 ≈ 1.22s（含云端重排）。
+- 收紧候选/上下文后的单轮复核：58 页/金标 `.9195/.9741`；hard50 页 `.780/.790`、金标 `.900/.910`（与上表不是同批）。
+- 答案质量（58 案、同一 answer/judge 模型）：Faithfulness `4.879`、Correctness `3.517`（1–5）；这是次级检查，不声明答案层优势。
+- 公开仓**不包含外部基线对比实验或对比指标**。
+
 ## 评测说明
 
-公开仓**不包含评测数据、评测结果，也不包含与普通 RAG 的对比实验**。本仓库只提供实现代码与部署说明；如需评估，请使用自己的语料和独立环境进行，不要把本地评测产物提交回仓库。
+公开仓只发布聚合指标与实验结论，不发布真实语料、查询原文、回答、金标路径或结果明细。
+

@@ -101,7 +101,7 @@ for src, tgt in edges:
 
 # Build report
 report_lines = []
-report_lines.append("# 企业知识库知识图谱报告")
+report_lines.append("# 知识图谱统计报告")
 report_lines.append("")
 report_lines.append(f"> 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}")
 report_lines.append("")
@@ -140,7 +140,7 @@ report_lines.append("")
 # Top 10 orphan pages
 report_lines.append("## Top 10 孤立页面（零入链）")
 report_lines.append("")
-report_lines.append("这些页面没有被任何其他页面引用，可能需要增加交叉链接。")
+report_lines.append("以下页面没有任何入链，可考虑补充交叉链接。")
 report_lines.append("")
 report_lines.append("| 序号 | 页面 | 分类 | 出度 |")
 report_lines.append("|------|------|------|------|")
@@ -168,7 +168,7 @@ for tag, members in tag_clusters_sorted:
 if dangling_links:
     report_lines.append("## 悬空链接（指向不存在的页面）")
     report_lines.append("")
-    report_lines.append("以下链接目标在知识库中不存在，建议创建对应页面或修正链接。")
+    report_lines.append("以下链接没有对应页面，请检查或补充。")
     report_lines.append("")
     report_lines.append("| 链接目标 | 被引用次数 | 引用来源 |")
     report_lines.append("|----------|------------|----------|")
