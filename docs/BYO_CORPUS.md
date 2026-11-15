@@ -55,7 +55,7 @@ python scripts/rag_search.py "你的问题" --mode balanced --json
 # 检索评测（使用你自己的 JSONL）
 python bench/run_retrieval_eval.py --file bench/dataset/queries.jsonl --mode auto
 
-# 组件消融（full / no_rerank / no_augment / lex_only / vec_only）
+# 组件消融（full / no_rerank / lex_only / vec_only）
 python bench/run_ablation.py --sets 58 --config config/rag.yaml
 
 # 词法策略对照（on/off/conditional/C2）

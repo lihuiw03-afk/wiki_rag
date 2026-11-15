@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """bench/run_ablation.py — 消融实验：各模块对检索质量的贡献
 
-变体：full / no_rerank / no_augment / lex_only / vec_only
+变体：full / no_rerank / lex_only / vec_only
 口径：全部强制检索（绕过 gate），指标与检索评测一致；同一数据集、同一进程。
 
 用法：.venv/Scripts/python.exe bench/run_ablation.py
@@ -100,11 +100,6 @@ def main():
         for m in modes.values():
             m["rerank"] = False
     results["no_rerank"] = run_variant("no_rerank", no_rerank, restore_modes)
-
-    def no_augment():
-        for m in modes.values():
-            m["use_graph"] = False
-    results["no_augment"] = run_variant("no_augment", no_augment, restore_modes)
 
     def lex_only():
         for m in modes.values():

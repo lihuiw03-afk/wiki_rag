@@ -6,7 +6,7 @@
 | 任务 | 脚本 |
 |---|---|
 | 检索评测（58 / hard50 / 19 / 24） | `run_retrieval_eval.py` |
-| 组件消融（full / no_rerank / no_augment / lex_only / vec_only） | `run_ablation.py` |
+| 组件消融（full / no_rerank / lex_only / vec_only） | `run_ablation.py` |
 | 词法策略 A/B/C/C2 | `run_lex_ab.py`、`lex_routing.py`、`analyze_lex_ab.py` |
 | E6-A 上下文预算 | `run_experiments.py`、`analyze_e6.py` |
 | 候选/上下文成本扫描 | `sweep_pool_ctx.py` |
