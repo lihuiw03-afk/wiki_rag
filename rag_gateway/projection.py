@@ -29,13 +29,29 @@ def _core_relpath(page_type: str, slug: str, node_id: str, idx: int) -> Path:
     return Path(page_type) / safe_name(slug) / f"{idx:03d}-{hid}.md"
 
 
-def build_projection(root: Path, config: dict) -> dict:
+def build_projection(root: Path, config: dict, target_root: Path | None = None) -> dict:
     p_cfg = config.get("projection", {})
     project_cfg = config.get("project", {})
-    rag_dir = root / project_cfg.get("rag_dir", "rag")
-    core_dir = root / project_cfg.get("projection_dir", "rag/qmd") / "core"
-    evidence_dir = root / project_cfg.get("projection_dir", "rag/qmd") / "evidence"
-    extracted_dir = root / project_cfg.get("extracted_dir", "rag/extracted")
+    if target_root is None:
+        projection_root = root / project_cfg.get("projection_dir", "rag/qmd")
+        extracted_root = root / project_cfg.get("extracted_dir", "rag/extracted")
+        manifest_path = root / project_cfg.get("manifest", "rag/manifest.json")
+        graph_path = root / project_cfg.get("graph", "rag/graph.json")
+        lexicon_path = root / project_cfg.get("lexicon", "rag/lexicon.json")
+        rag_dir = root / project_cfg.get("rag_dir", "rag")
+    else:
+        # Staging build: never touch the live projection until the complete tree
+        # has been produced and validated.
+        target_root = Path(target_root)
+        projection_root = target_root / "qmd"
+        extracted_root = target_root / "extracted"
+        manifest_path = target_root / "manifest.json"
+        graph_path = target_root / "graph.json"
+        lexicon_path = target_root / "lexicon.json"
+        rag_dir = target_root
+    core_dir = projection_root / "core"
+    evidence_dir = projection_root / "evidence"
+    extracted_dir = extracted_root
     include_infra = bool(p_cfg.get("include_infrastructure_pages", False))
     summary_chars = int(p_cfg.get("summary_chars", 260))
     chunk_chars = int(p_cfg.get("evidence_chunk_chars", 3200))
@@ -233,14 +249,17 @@ def build_projection(root: Path, config: dict) -> dict:
 
     manifest["page_nodes"] = dict(manifest["page_nodes"])
     manifest["raw_chunks"] = dict(manifest["raw_chunks"])
-    (root / project_cfg.get("manifest", "rag/manifest.json")).write_text(
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n"
     )
-    (root / project_cfg.get("graph", "rag/graph.json")).write_text(
+    graph_path.parent.mkdir(parents=True, exist_ok=True)
+    graph_path.write_text(
         json.dumps(graph, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n"
     )
     lexicon = {"terms": sorted(lex_terms, key=lambda x: (-len(str(x)), str(x)))}
-    (root / project_cfg.get("lexicon", "rag/lexicon.json")).write_text(
+    lexicon_path.parent.mkdir(parents=True, exist_ok=True)
+    lexicon_path.write_text(
         json.dumps(lexicon, ensure_ascii=False, indent=2), encoding="utf-8", newline="\n"
     )
     visual_docs = list(manifest.get("raw_extracted", {}).values())
@@ -255,3 +274,113 @@ def build_projection(root: Path, config: dict) -> dict:
         "visual_pending_assets": sum(int((d.get("visual_analysis") or {}).get("pending_asset_count", 0)) for d in visual_docs),
         "visual_unresolved_assets": sum(int((d.get("visual_analysis") or {}).get("unresolved_vision_asset_count", 0)) for d in visual_docs),
     }
+
+
+def swap_projection(staging_root: Path, root: Path, defer_metadata: bool = False) -> Path:
+    """Swap a fully built staging projection into the live tree.
+
+    The live tree is never emptied while a build is running. This function only
+    runs after build_projection() has completed successfully; it moves the old
+    tree to a timestamped backup and then installs the new tree. If a rename
+    fails (for example because a file is open on Windows), it restores the old
+    tree and raises, leaving the live projection intact.
+
+    With defer_metadata=True, only qmd/core, qmd/evidence and extracted are
+    swapped. graph/lexicon/manifest stay in staging and must be installed with
+    install_metadata() after qmd update/embed. This keeps the old manifest
+    usable while QMD is being refreshed.
+    """
+    import os
+    import time
+
+    staging_root = Path(staging_root)
+    live = Path(root) / "rag"
+    previous = live / f".projection-prev-{int(time.time())}-{os.getpid()}"
+    previous.mkdir(parents=True, exist_ok=True)
+
+    pairs = [
+        ("qmd/core", live / "qmd" / "core"),
+        ("qmd/evidence", live / "qmd" / "evidence"),
+        ("extracted", live / "extracted"),
+    ]
+    if not defer_metadata:
+        pairs.extend([
+            ("graph.json", live / "graph.json"),
+            ("lexicon.json", live / "lexicon.json"),
+            ("manifest.json", live / "manifest.json"),
+        ])
+    backed_up: list[tuple[Path, Path]] = []
+    installed: list[Path] = []
+    try:
+        for src_rel, dst in pairs:
+            src = staging_root / src_rel
+            if not os.path.lexists(src):
+                raise FileNotFoundError(f"staging projection missing: {src}")
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if os.path.lexists(dst):
+                backup = previous / src_rel
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                dst.rename(backup)
+                backed_up.append((dst, backup))
+            src.rename(dst)
+            installed.append(dst)
+    except Exception:
+        # Roll back installed entries, then restore the old live tree.
+        for dst in reversed(installed):
+            if os.path.lexists(dst):
+                dst.rename(staging_root / dst.relative_to(live))
+        for dst, backup in reversed(backed_up):
+            if os.path.lexists(backup):
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                backup.rename(dst)
+        raise
+
+    if defer_metadata:
+        return previous
+
+    shutil.rmtree(staging_root, ignore_errors=True)
+    return previous
+
+
+def install_metadata(staging_root: Path, root: Path, previous: Path | None = None) -> Path:
+    """Install graph/lexicon/manifest after QMD has finished indexing.
+
+    This is the second phase of plan A: old manifest remains active while
+    qmd update/embed runs, then metadata is switched atomically (manifest last).
+    """
+    import os
+    import time
+
+    staging_root = Path(staging_root)
+    live = Path(root) / "rag"
+    backup_root = Path(previous) if previous is not None else live / f".metadata-prev-{int(time.time())}-{os.getpid()}"
+    backup_root.mkdir(parents=True, exist_ok=True)
+
+    names = ["graph.json", "lexicon.json", "manifest.json"]
+    backed_up: list[tuple[Path, Path]] = []
+    installed: list[Path] = []
+    try:
+        for name in names:
+            src = staging_root / name
+            dst = live / name
+            if not os.path.lexists(src):
+                raise FileNotFoundError(f"staging metadata missing: {src}")
+            if os.path.lexists(dst):
+                backup = backup_root / name
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                dst.rename(backup)
+                backed_up.append((dst, backup))
+            src.rename(dst)
+            installed.append(dst)
+    except Exception:
+        for dst in reversed(installed):
+            if os.path.lexists(dst):
+                dst.rename(staging_root / dst.name)
+        for dst, backup in reversed(backed_up):
+            if os.path.lexists(backup):
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                backup.rename(dst)
+        raise
+
+    shutil.rmtree(staging_root, ignore_errors=True)
+    return backup_root

@@ -34,22 +34,51 @@ class CompanyRAG:
         self.root = root.resolve()
         self.config = load_config(self.root)
         pcfg = self.config["project"]
-        self.manifest = json.loads((self.root / pcfg["manifest"]).read_text(encoding="utf-8"))
-        self.graph = json.loads((self.root / pcfg["graph"]).read_text(encoding="utf-8"))
-        self.lexicon = json.loads((self.root / pcfg["lexicon"]).read_text(encoding="utf-8"))
-        self.entity_pages = {
-            str(n.get("page_title")): str(n.get("page_relpath"))
-            for n in self.manifest.get("nodes", {}).values()
-            if str(n.get("page_relpath") or "").startswith("wiki/entities/") and n.get("page_title")}
-        self.entity_names = sorted(self.entity_pages.keys(), key=len, reverse=True)
+        self._manifest_path = self.root / pcfg["manifest"]
+        self._graph_path = self.root / pcfg["graph"]
+        self._lexicon_path = self.root / pcfg["lexicon"]
+        self._metadata_sig = None
+        self._load_metadata()
         qcfg = self.config["qmd"]
         self.qmd = QMDClient(
             qcfg["base_url"],
             int(qcfg.get("timeout_seconds", 30)),
             bool(qcfg.get("cli_fallback", True)),
+            base_urls=qcfg.get("base_urls"),
         )
         self.rerank_api = ApiReranker(self.config.get("rerank_api") or {})
         self._last_rerank_error: str | None = None
+
+    def _metadata_signature(self):
+        try:
+            st = self._manifest_path.stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
+    def _load_metadata(self) -> None:
+        self.manifest = json.loads(self._manifest_path.read_text(encoding="utf-8"))
+        self.graph = json.loads(self._graph_path.read_text(encoding="utf-8"))
+        self.lexicon = json.loads(self._lexicon_path.read_text(encoding="utf-8"))
+        self.entity_pages = {
+            str(n.get("page_title")): str(n.get("page_relpath"))
+            for n in self.manifest.get("nodes", {}).values()
+            if str(n.get("page_relpath") or "").startswith("wiki/entities/") and n.get("page_title")
+        }
+        self.entity_names = sorted(self.entity_pages.keys(), key=len, reverse=True)
+        self._metadata_sig = self._metadata_signature()
+
+    def reload_if_stale(self) -> bool:
+        """Reload manifest/graph/lexicon after an atomic projection switch.
+
+        The sidecar keeps thread-local CompanyRAG instances warm, so without this
+        check a completed refresh would remain invisible until the sidecar restarts.
+        """
+        sig = self._metadata_signature()
+        if sig is None or sig == self._metadata_sig:
+            return False
+        self._load_metadata()
+        return True
 
     @staticmethod
     def _projection_from_uri(file: str) -> tuple[str, str]:
@@ -80,18 +109,32 @@ class CompanyRAG:
         return None
 
     def _local_content(self, node: dict) -> str:
-        base = self.root / "rag/qmd/core" if node["collection"] == "company-core" else self.root / "rag/qmd/evidence"
-        p = base / node["projection"]
-        if not p.exists():
-            return ""
-        text = p.read_text(encoding="utf-8", errors="replace")
-        # Remove YAML frontmatter from generation context. Search-time metadata is
-        # already indexed by QMD; the final answer needs the readable evidence.
-        if text.startswith("---\n"):
-            end = text.find("\n---\n", 4)
-            if end >= 0:
-                text = text[end + 5:]
-        return text.strip()
+        collection_dir = Path("qmd/core") if node["collection"] == "company-core" else Path("qmd/evidence")
+        rel = collection_dir / str(node["projection"])
+        # During the short live swap window, a request may still hold the old
+        # manifest. Keep the previous generation readable as a fallback so that
+        # in-flight/old clients do not see a deleted projection or an empty block.
+        roots = [self.root / "rag"]
+        prev_root = self.root / "rag"
+        if prev_root.exists():
+            roots.extend(sorted(prev_root.glob(".projection-prev-*"), reverse=True))
+        for base in roots:
+            p = base / rel
+            for _ in range(2):
+                if p.exists():
+                    break
+                time.sleep(0.02)
+            if not p.exists():
+                continue
+            text = p.read_text(encoding="utf-8", errors="replace")
+            # Remove YAML frontmatter from generation context. Search-time metadata is
+            # already indexed by QMD; the final answer needs the readable evidence.
+            if text.startswith("---\n"):
+                end = text.find("\n---\n", 4)
+                if end >= 0:
+                    text = text[end + 5:]
+            return text.strip()
+        return ""
 
     def _to_hit(self, node_id: str, score: float, reason: str) -> RetrievalHit:
         n = self.manifest["nodes"][node_id]
@@ -203,6 +246,57 @@ class CompanyRAG:
                 scores[nid] = max(scores.get(nid, float("-inf")), float(qh.score))
         return scores
 
+    def _restricted_batch(
+        self,
+        *,
+        searches: list[dict],
+        requests: list[dict],
+        rerank: bool,
+        intent: str,
+    ) -> dict[str, float]:
+        """One restricted QMD call covering graph + source allowed sets.
+
+        Both structural passes remain enabled; this only batches their QMD calls.
+        Candidate budgets are summed so the merged call cannot silently shrink the
+        union below the two separate passes.
+        """
+        allowed: set[str] = set()
+        collections: list[str] = []
+        labels: list[str] = []
+        for req in requests:
+            allowed |= req["allowed"]
+            if req["collection"] not in collections:
+                collections.append(req["collection"])
+            labels.extend(req["labels"])
+        if not allowed:
+            return {}
+        scfg = self.config["structure"]
+        boosted = self._boost_searches(
+            searches, labels, int(scfg.get("max_restricted_query_labels", 8))
+        )
+        limit = int(scfg.get("restricted_limit", 36)) * len(requests)
+        candidate = int(scfg.get("restricted_candidate_limit", 72)) * len(requests)
+        try:
+            qhits = self.qmd.query(
+                searches=boosted,
+                collections=collections,
+                limit=limit,
+                candidate_limit=candidate,
+                min_score=float(scfg.get("restricted_min_score", 0.05)),
+                rerank=rerank,
+                intent=intent,
+            )
+        except Exception:
+            # Structural augmentation must fail soft; primary retrieval already
+            # succeeded.
+            return {}
+        scores: dict[str, float] = {}
+        for qh in qhits:
+            nid = self._node_from_qmd(qh)
+            if nid and nid in allowed:
+                scores[nid] = max(scores.get(nid, float("-inf")), float(qh.score))
+        return scores
+
     def _best_node(self, query: str, node_ids: list[str], qmd_scores: dict[str, float]) -> tuple[str | None, float]:
         if not node_ids:
             return None, 0.0
@@ -215,10 +309,169 @@ class CompanyRAG:
         nid = max(node_ids, key=lambda x: self._local_relevance(query, x))
         return nid, self._local_relevance(query, nid)
 
+    def _augment_merged(self, hits: list[RetrievalHit], mode: str, query: str, searches: list[dict]) -> list[RetrievalHit]:
+        """Merged-expansion path: one QMD call for graph + source passes.
+
+        This is the production equivalent of bench MergedFixed:
+        - graph + source allowed sets are unioned into one restricted query;
+        - graph section scores and source chunk scores come from that same batch;
+        - source injected relevance is fixed at 1.0 (H48 calibration), because
+          merged QMD fusion otherwise dilutes the source score.
+        """
+        if not self.config["retrieval"]["modes"][mode].get("use_graph"):
+            return hits
+        scfg = self.config["structure"]
+        fixed_source = str(scfg.get("merge_source_relevance", "fixed")).lower() == "fixed"
+        by_id = {h.node_id: h for h in hits}
+        additions: list[RetrievalHit] = []
+
+        def add(node_id, score, reason):
+            if not node_id or node_id in by_id or node_id not in self.manifest["nodes"]:
+                return False
+            h = self._to_hit(node_id, score, reason)
+            by_id[node_id] = h
+            additions.append(h)
+            return True
+
+        # 1) hierarchical parent/child (no QMD)
+        for hit in list(hits):
+            n = self.manifest["nodes"].get(hit.node_id, {})
+            if n.get("collection") != "company-core":
+                continue
+            if hit.score >= float(scfg["parent_score_threshold"]):
+                add(n.get("parent_id"), hit.score * float(scfg["parent_score_discount"]), "parent-context")
+            if hit.score >= float(scfg["child_score_threshold"]):
+                for cid in (n.get("children_ids") or [])[: int(scfg["max_children_per_hit"])]:
+                    add(cid, hit.score * float(scfg["child_score_discount"]), "child-context")
+
+        # 2) graph neighbor candidates
+        represented_pages = {
+            self.manifest["nodes"].get(h.node_id, {}).get("page_relpath")
+            for h in hits if h.collection == "company-core"
+        }
+        page_seed_scores = {}
+        for hit in hits:
+            n = self.manifest["nodes"].get(hit.node_id, {})
+            page = n.get("page_relpath")
+            if n.get("collection") == "company-core" and page and hit.score >= float(scfg["graph_score_threshold"]):
+                page_seed_scores[page] = max(page_seed_scores.get(page, 0.0), hit.score)
+        target_seed_scores = {}
+        target_budget = int(scfg["max_graph_neighbors"])
+        for page, seed_score in sorted(page_seed_scores.items(), key=lambda x: x[1], reverse=True)[:3]:
+            neighbors = self.graph.get("edges", {}).get(page, []) + self.graph.get("incoming", {}).get(page, [])
+            for target in neighbors:
+                if target in represented_pages or target not in self.manifest.get("page_nodes", {}):
+                    continue
+                target_seed_scores[target] = max(target_seed_scores.get(target, 0.0), seed_score)
+                if len(target_seed_scores) >= target_budget:
+                    break
+            if len(target_seed_scores) >= target_budget:
+                break
+
+        graph_req = None
+        if target_seed_scores:
+            allowed_ids = {nid for page in target_seed_scores
+                           for nid in (self.manifest.get("page_nodes", {}).get(page) or [])}
+            labels = []
+            for page in target_seed_scores:
+                root_id = self.manifest.get("page_roots", {}).get(page)
+                if root_id:
+                    root = self.manifest["nodes"].get(root_id, {})
+                    labels.extend([root.get("page_title", ""), root.get("title", "")])
+            graph_req = {"collection": "company-core", "allowed": allowed_ids,
+                         "labels": labels, "kind": "graph"}
+
+        # 3) source support candidates
+        existing_raws = {
+            self.manifest["nodes"].get(h.node_id, {}).get("raw_path")
+            for h in hits if h.collection == "company-evidence"
+        }
+        raw_seed_scores = {}
+        raw_labels = {}
+        for hit in hits:
+            n = self.manifest["nodes"].get(hit.node_id, {})
+            if n.get("collection") != "company-core" or hit.score < float(scfg["graph_score_threshold"]):
+                continue
+            for logical_raw in n.get("raw_sources") or []:
+                actual_raw = self.manifest.get("raw_alias_to_actual", {}).get(logical_raw, logical_raw)
+                if actual_raw in existing_raws or actual_raw not in self.manifest.get("raw_chunks", {}):
+                    continue
+                raw_seed_scores[actual_raw] = max(raw_seed_scores.get(actual_raw, 0.0), hit.score)
+                raw_labels[actual_raw] = Path(logical_raw).stem
+        support_budget = int(scfg["max_source_support"])
+        candidate_raws = dict(sorted(raw_seed_scores.items(), key=lambda x: x[1], reverse=True)[:support_budget])
+        source_req = None
+        if candidate_raws:
+            allowed_ids = {nid for raw in candidate_raws
+                           for nid in (self.manifest.get("raw_chunks", {}).get(raw) or [])}
+            source_req = {"collection": "company-evidence", "allowed": allowed_ids,
+                          "labels": [raw_labels.get(raw, Path(raw).stem) for raw in candidate_raws],
+                          "kind": "source"}
+
+        # ONE restricted QMD call for both graph and source passes
+        reqs = [r for r in (graph_req, source_req) if r]
+        batch_scores = self._restricted_batch(
+            searches=searches, requests=reqs, rerank=False,
+            intent="合并：图邻居章节 + 关联原始资料证据",
+        ) if reqs else {}
+
+        if graph_req:
+            for page, seed_score in sorted(target_seed_scores.items(), key=lambda x: x[1], reverse=True):
+                nid, relevance = self._best_node(query, self.manifest["page_nodes"].get(page, []), batch_scores)
+                if nid:
+                    score = seed_score * float(scfg["graph_score_discount"]) * (0.85 + 0.15 * relevance)
+                    add(nid, score, "wiki-graph-section")
+
+        if source_req:
+            per_raw = int(scfg.get("source_support_per_raw", 1))
+            remaining = support_budget
+            for raw, seed_score in candidate_raws.items():
+                if remaining <= 0:
+                    break
+                ids = self.manifest["raw_chunks"].get(raw) or []
+                ranked_ids = sorted(ids, key=lambda nid: batch_scores.get(nid, self._local_relevance(query, nid)),
+                                    reverse=True)[:per_raw]
+                for nid in ranked_ids:
+                    qmd_rel = self._clip01(batch_scores.get(nid, self._local_relevance(query, nid)))
+                    relevance = 1.0 if fixed_source else qmd_rel
+                    score = seed_score * float(scfg["evidence_score_discount"]) * (0.85 + 0.15 * relevance)
+                    if add(nid, score, "source-evidence-restricted"):
+                        remaining -= 1
+                    if remaining <= 0:
+                        break
+
+        # 4) multi-entity coverage (unchanged; rare extra restricted calls)
+        mentions = entity_mentions(query, self.entity_names)
+        if len(mentions) >= 2:
+            represented = {self.manifest["nodes"].get(h.node_id, {}).get("page_relpath")
+                           for h in hits + additions}
+            seed = max((h.score for h in hits), default=0.0)
+            for name in mentions[:3]:
+                page = self.entity_pages.get(name)
+                if not page or page in represented or seed <= 0:
+                    continue
+                node_ids = self.manifest.get("page_nodes", {}).get(page) or []
+                if not node_ids:
+                    continue
+                restricted = self._restricted_qmd_scores(
+                    searches=searches, collection="company-core", allowed_node_ids=set(node_ids),
+                    labels=[name], rerank=False,
+                    intent="多实体问句实体页章节",
+                )
+                nid, relevance = self._best_node(query, node_ids, restricted)
+                if nid:
+                    add(nid, seed * float(scfg.get("entity_score_discount", 0.95)) * (0.85 + 0.15 * relevance),
+                        "entity-context")
+
+        additions = sorted(additions, key=lambda h: h.score, reverse=True)[: int(scfg["max_augmented_hits"])]
+        return sorted(hits + additions, key=lambda h: h.score, reverse=True)
+
     def _augment(self, hits: list[RetrievalHit], mode: str, query: str, searches: list[dict]) -> list[RetrievalHit]:
         if not self.config["retrieval"]["modes"][mode].get("use_graph"):
             return hits
         scfg = self.config["structure"]
+        if bool(scfg.get("merge_restricted_expansions", False)):
+            return self._augment_merged(hits, mode, query, searches)
         by_id = {h.node_id: h for h in hits}
         additions: list[RetrievalHit] = []
 
@@ -352,7 +605,7 @@ class CompanyRAG:
                     if remaining <= 0:
                         break
 
-        # 4) 多实体覆盖：对照/比较类问句中，确保每个被提及实体的页面
+        # 4) 多实体覆盖（评测驱动 X01）：对照/比较类问句中，确保每个被提及实体的页面
         #    至少有一个候选；对在重排后缺席的实体页，做受限检索挑最佳章节注入。
         mentions = entity_mentions(query, self.entity_names)
         if len(mentions) >= 2:
@@ -502,8 +755,8 @@ class CompanyRAG:
 
         budget_policy = str(self.config.get("context", {}).get("budget_policy", "score"))
         if budget_policy == "density":
-            # Density ordering: order by score / block length (higher value per character). Selection
-            # itself is unchanged; "score" (default) keeps the original behavior.
+            # E6-A: order by score / block length (higher value per character). Selection
+            # itself is unchanged; "score" keeps the legacy behavior (rollback switch).
             selected = sorted(selected, key=lambda h: h.score / max(1, len(make_block(h, 0))), reverse=True)
         else:
             selected = sorted(selected, key=lambda h: h.score, reverse=True)
@@ -641,6 +894,7 @@ class CompanyRAG:
         keep = int(mcfg["limit"])
         use_api_rerank = bool(mcfg.get("rerank")) and self.rerank_api.available()
         rerank_mode = "local" if bool(mcfg.get("rerank")) else "none"
+        qmd_started = time.perf_counter()
         if use_api_rerank:
             qhits = self.qmd.query(
                 searches=searches,
@@ -661,6 +915,7 @@ class CompanyRAG:
                 rerank=bool(mcfg["rerank"]),
                 intent="企业内部知识检索；优先可追溯事实、相关实体/概念和原始证据",
             )
+        qmd_ms = (time.perf_counter() - qmd_started) * 1000
         hits: list[RetrievalHit] = []
         seen = set()
         for qh in qhits:
@@ -669,11 +924,15 @@ class CompanyRAG:
                 continue
             seen.add(nid)
             hits.append(self._to_hit(nid, qh.score, "qmd"))
+        rerank_ms = 0.0
         if use_api_rerank:
+            rr_started = time.perf_counter()
             hits, rerank_mode = self._api_rerank(
                 query, hits, keep=keep, searches=searches, collections=collections, mcfg=mcfg
             )
-        return hits, rerank_mode, searches, collections, mcfg
+            rerank_ms = (time.perf_counter() - rr_started) * 1000
+        timing = {"qmd_ms": round(qmd_ms, 1), "rerank_ms": round(rerank_ms, 1)}
+        return hits, rerank_mode, searches, collections, mcfg, timing
 
     def search(
         self,
@@ -691,18 +950,36 @@ class CompanyRAG:
 
         # All employees have full access in this deployment. `profile` is retained only
         # as caller identity for traces/Hermes integration; it never filters retrieval.
-        hits, rerank_mode, searches, collections, mcfg = self._fetch_hits(query, mode, hyde)
+        fetch_started = time.perf_counter()
+        hits, rerank_mode, searches, collections, mcfg, fetch_timing = self._fetch_hits(query, mode, hyde)
         escalated_from = None
         if mode == "fast" and not hits:
             # 快速路径零命中（词表未覆盖的间接问句——lex 仅词表词）：自动升级到 balanced。
-            # Regression cases: fast can return empty for indirect natural-language queries.
+            # 依据：bench/results 检索评测中多个间接型问句在 fast 下静默返回空上下文。
             escalated_from = "fast"
             mode = "balanced"
-            hits, rerank_mode, searches, collections, mcfg = self._fetch_hits(query, mode, hyde)
+            hits, rerank_mode, searches, collections, mcfg, second = self._fetch_hits(query, mode, hyde)
+            fetch_timing = {
+                "qmd_ms": round(fetch_timing["qmd_ms"] + second["qmd_ms"], 1),
+                "rerank_ms": round(fetch_timing["rerank_ms"] + second["rerank_ms"], 1),
+            }
+        fetch_ms = round((time.perf_counter() - fetch_started) * 1000, 1)
 
+        augment_started = time.perf_counter()
         hits = self._augment(hits, mode, query, searches)
+        augment_ms = round((time.perf_counter() - augment_started) * 1000, 1)
+
+        compose_started = time.perf_counter()
         context, selected, context_stats = self._compose_context(hits, context_policy)
+        compose_ms = round((time.perf_counter() - compose_started) * 1000, 1)
         elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+        stage_ms = {
+            "fetch_ms": fetch_ms,
+            "fetch_qmd_ms": fetch_timing["qmd_ms"],
+            "fetch_rerank_ms": fetch_timing["rerank_ms"],
+            "augment_ms": augment_ms,
+            "compose_ms": compose_ms,
+        }
         result = {
             "query": query,
             "mode": mode,
@@ -716,6 +993,7 @@ class CompanyRAG:
             "rerank_error": self._last_rerank_error,
             "escalated_from": escalated_from,
             "elapsed_ms": elapsed_ms,
+            "stage_ms": stage_ms,
             "context_stats": context_stats,
             "retrieved": [h.to_dict(include_content=False) for h in hits],
             "selected": [h.to_dict(include_content=False) | {"citation": f"S{i+1}"} for i, h in enumerate(selected)],

@@ -1,6 +1,6 @@
 from __future__ import annotations
 from pathlib import Path
-import json, re, time
+import json, re, threading, time
 from .config import load_config
 from .gating import choose_route
 from .hot import HotDocumentStore
@@ -18,9 +18,31 @@ class CompanyKnowledgeGateway:
         try:self.lexicon=json.loads(lex_path.read_text(encoding="utf-8"))
         except Exception:self.lexicon={"terms":[]}
         self.hot=HotDocumentStore(self.root,self.config)
+        self._local=threading.local()
+
+    def _company(self):
+        """One CompanyRAG per worker thread (manifest/lexicon loaded once).
+
+        The sidecar reuses a fixed pool of threads; a shared instance would race on
+        _last_rerank_error, so each thread keeps its own copy.
+        """
+        rag=getattr(self._local,"company",None)
+        if rag is None:
+            from .search import CompanyRAG
+            rag=CompanyRAG(self.root)
+            self._local.company=rag
+        return rag
 
     def ask(self, query: str, profile: str|None=None, attachment: str|None=None, route: str="auto", mode: str="auto", context_policy: str="auto", hyde: str|None=None) -> dict:
         started=time.perf_counter()
+        # The sidecar keeps thread-local CompanyRAG instances warm. Refresh their
+        # manifest/lexicon before routing so newly compiled entity terms are visible
+        # without a service restart. No CompanyRAG is created for direct/hot-only
+        # clients that never touch the formal index.
+        cached_company = getattr(self._local, "company", None)
+        if cached_company is not None:
+            cached_company.reload_if_stale()
+            self.lexicon = cached_company.lexicon
         recent=self.hot.resolve(profile=profile,max_age_seconds=int(self.config.get("hot_document",{}).get("recent_ttl_seconds",7200)))
         decision=choose_route(query,self.lexicon.get("terms",[]),attachment=attachment,has_recent_hot=bool(recent),requested=route)
         if decision.route=="direct":
@@ -30,8 +52,10 @@ class CompanyKnowledgeGateway:
             hot.update({"query":query,"route_decision":decision.to_dict(),"profile":profile,"elapsed_ms":round((time.perf_counter()-started)*1000,1)})
             return hot
         # Lazy import keeps hot/direct routing independent from QMD availability.
-        from .search import CompanyRAG
-        company=CompanyRAG(self.root).search(query,mode=mode,profile=profile,hyde=hyde,context_policy=context_policy)
+        company_rag = self._company()
+        company_rag.reload_if_stale()
+        self.lexicon = company_rag.lexicon
+        company=company_rag.search(query,mode=mode,profile=profile,hyde=hyde,context_policy=context_policy)
         if decision.route=="company-rag":
             company["route"]="company-rag"; company["route_decision"]=decision.to_dict(); return company
         hot=self.hot.search(query,attachment=attachment,profile=profile)

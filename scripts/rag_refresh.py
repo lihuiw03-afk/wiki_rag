@@ -6,7 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / ".scripts"))
 from rag_gateway.config import load_config
-from rag_gateway.projection import build_projection
+from rag_gateway.projection import build_projection, swap_projection, install_metadata
 from _locklib import file_lock
 
 try:
@@ -95,13 +95,38 @@ if _env_file.exists():
             os.environ.setdefault(_k.strip(), _v.strip())
 
 status("projection")
+staging = root / "rag" / f".projection-staging-{os.getpid()}-{int(time.time())}"
 try:
-    stats = build_projection(root, load_config(root))
+    # Build the complete projection off to the side. Live core/evidence/extracted
+    # files remain readable while OCR/Vision and Wiki projection run.
+    stats = build_projection(root, load_config(root), target_root=staging)
 except Exception as exc:
+    shutil.rmtree(staging, ignore_errors=True)
     fail(f"projection: {exc}")
     raise
+try:
+    switch_flag = root / "rag" / ".projection_switch"
+    switch_flag.parent.mkdir(parents=True, exist_ok=True)
+    switch_flag.write_text(str(os.getpid()), encoding="utf-8")
+    try:
+        previous = swap_projection(staging, root, defer_metadata=True)
+    finally:
+        try:
+            switch_flag.unlink()
+        except FileNotFoundError:
+            pass
+except Exception as exc:
+    shutil.rmtree(staging, ignore_errors=True)
+    fail(f"projection switch: {exc}")
+    raise
 print("projection:", json.dumps(stats, ensure_ascii=False))
+print("projection switch: previous=", previous)
 if args.no_qmd:
+    try:
+        install_metadata(staging, root, previous)
+    except Exception as exc:
+        fail(f"metadata switch: {exc}")
+        raise
     finish({"qmd": "skipped"})
     raise SystemExit(0)
 if not shutil.which("qmd"):
@@ -133,6 +158,14 @@ try:
     subprocess.run(cmd, cwd=root, check=True)
 except Exception as exc:
     fail(f"qmd embed: {exc}")
+    raise
+
+# Plan A: keep the old manifest/graph/lexicon active while QMD is being
+# updated. Only after update+embed succeeds do we expose the new metadata.
+try:
+    install_metadata(staging, root, previous)
+except Exception as exc:
+    fail(f"metadata switch: {exc}")
     raise
 finish({"qmd": "done"})
 print("QMD index refreshed")

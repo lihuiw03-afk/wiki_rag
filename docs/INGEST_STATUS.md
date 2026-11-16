@@ -74,6 +74,44 @@ uploaded → queued → claimed → extracting → wiki_compiling
 
 `rag_refresh.py` 使用独立的 `.rag_refresh.lock` 串行化整个 `projection → qmd update → qmd embed`；第二个 refresh 会等待，不会并发写投影或同时发起 embed。
 
+## 投影切换安全
+
+`rag_refresh` 不在开头删除 live 投影，而是先构建到 `rag/.projection-staging-*`，验证成功后再切换：
+
+```text
+build staging/core + evidence + extracted + manifest/graph/lexicon
+→ 设置 rag/.projection_switch
+→ 旧 live 的 core/evidence/extracted 移到 rag/.projection-prev-<ts>-<pid>
+→ 新 staging 的 core/evidence/extracted 切入 live
+→ 移除 switch 标记
+→ qmd update + qmd embed
+→ 成功后安装新的 graph/lexicon/manifest（manifest 最后）
+```
+
+- 构建期间 live `rag/qmd/core`、`evidence`、`extracted` 仍可读，查询不会看到“投影已删除”。
+- 构建失败：live 投影完全不动。
+- 投影目录切换失败：`swap_projection` 会尝试恢复旧 live 投影。
+- `qmd update/embed` 期间：**继续使用旧 manifest + 旧 QMD**；新 projection 目录已在新路径，但新 graph/lexicon/manifest 还没有暴露。
+- QMD 更新成功后：才安装新 manifest；sidecar 在请求前检查 manifest mtime/size，自动 reload，不需要重启。
+- 旧投影保留在 `rag/.projection-prev-*`，可用于人工回滚；它不参与 QMD 索引。
+- QMD 更新失败：旧 manifest 不被替换，旧查询继续可用；新页面暂不可见，任务标记失败。
+- `.projection_switch` 只是切换窗口的观测标记，不阻塞查询；旧 manifest 指向的文件已被移走时，`CompanyRAG` 从最近的 `rag/.projection-prev-*` 读取旧块作为 fallback。
+
+## 重建期间查询
+
+| 阶段 | 查询行为 |
+|---|---|
+| staging 构建中 | live 投影仍完整；`company-rag` 继续读旧 projection + 旧 manifest + 旧 QMD 索引，看到的是**上一版知识快照**；`direct` / `hot-document` 不受影响 |
+| live swap 窗口 | 正式 RAG 不阻塞：旧 manifest 的块从 `rag/.projection-prev-*` fallback；新请求在 manifest 切换后读取新投影；如果 swap 失败，旧投影已恢复 |
+| qmd update / embed | 旧 manifest + 旧 QMD 继续服务；新 projection 目录已经就位，但新 metadata/manifest 还没安装；新页面暂时查不到，旧查询正常 |
+| 新上传文件 | `rag_hot_ingest` 和 Hot 路径立即可用；正式 Wiki/QMD 索引等下一次 refresh |
+
+关键语义：
+
+- 重建期间不是“停止 RAG”，而是**读旧快照**。
+- 新编译内容在切换前不可见，这是有意的延迟，不是丢失。
+- 如果业务要求“重建期间不能看到旧数据”，需要在接入层返回数据版本/延迟提示，或改用双 generation + 双 QMD 索引；当前实现优先保证可用性和不返回空上下文。
+
 ## 查询
 
 ```bash
